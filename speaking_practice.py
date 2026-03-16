@@ -1,6 +1,11 @@
 """
-Модуль практики устной речи (Speaking Practice).
-Распознавание голоса (Whisper), диалог с GigaChat, меню и настройки скорости.
+Speaking Practice: voice/text chat with an AI coach (GigaChat).
+
+Logic:
+  - Menu: start practice, speech speed settings, end session.
+  - State: user_speaking_state[chat_id] = { speed, conversation_history, chat_id }.
+  - Incoming voice → download, transcribe (Whisper), then same path as text.
+  - Incoming text → build messages from system prompt + history + new message → GigaChat → reply text + TTS voice.
 """
 
 import os
@@ -8,51 +13,42 @@ import re
 import subprocess
 import tempfile
 import logging
+import io
 import requests
-import json
 import urllib3
 from telebot import types
 import uuid
 
-# --- Логирование ---
 logger = logging.getLogger(__name__)
 
-# --- Распознавание речи (Whisper) ---
-# Модель загружается лениво при первом голосовом сообщении
+# Whisper: loaded on first voice message
 _whisper_model = None
-WHISPER_MODEL_SIZE = "base"  # base / small / medium — быстрее и легче / точнее
+WHISPER_MODEL_SIZE = "base"
 WHISPER_LANGUAGE = "en"
 
-# Отключаем предупреждения SSL для запросов к GigaChat
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# --- Переменные окружения ---
 GIGACHAT_API_KEY = os.getenv("GIGACHAT_API_KEY")
 GIGACHAT_MODEL_NAME = os.getenv("GIGACHAT_MODEL_NAME")
 
-# --- Состояние сессий пользователей ---
-# Ключ: user_id, значение: dict с speed, conversation_history, chat_id
+# Active sessions: chat_id -> { speed, conversation_history, chat_id }
 user_speaking_state = {}
 
-# Speech speed labels for UI (simple English)
-SPEECH_SPEEDS = {
-    "slow": "Slow",
-    "normal": "Normal",
-    "fast": "Fast",
-}
+SPEECH_SPEEDS = {"slow": "Slow", "normal": "Normal", "fast": "Fast"}
 
-# Сколько последних пар user/assistant хранить в истории (чтобы не превысить лимит токенов API)
+# Keep last N messages in history for API context window
 MAX_HISTORY_MESSAGES = 20
-
-# Max length of text to send to TTS (gTTS and Telegram voice note limits)
 MAX_TTS_CHARS = 4000
+# Shorter text for voice = fewer gTTS requests and faster upload
+MAX_VOICE_TTS_CHARS = 450
 
+
+# ---------------------------------------------------------------------------
+# GigaChat: OAuth token and prompt file
+# ---------------------------------------------------------------------------
 
 def get_access_token():
-    """
-    Получает OAuth access_token для GigaChat по client_id:client_secret (Base64).
-    Возвращает access_token или None при ошибке.
-    """
+    """Get GigaChat OAuth token (Basic base64 client_id:secret). Returns None on error."""
     if not GIGACHAT_API_KEY:
         logger.error("GIGACHAT_API_KEY не задан в окружении")
         return None
@@ -89,10 +85,7 @@ def get_access_token():
 
 
 def read_prompt(prompt_file_name):
-    """
-    Загружает текст системного промпта из папки prompts/ в корне проекта.
-    Возвращает строку или None при ошибке.
-    """
+    """Load system prompt from prompts/<prompt_file_name>. Returns None if missing."""
     project_root = os.path.dirname(os.path.abspath(__file__))
     prompt_path = os.path.join(project_root, "prompts", prompt_file_name)
     logger.debug("Чтение промпта: %s", prompt_path)
@@ -110,8 +103,12 @@ def read_prompt(prompt_file_name):
         return None
 
 
+# ---------------------------------------------------------------------------
+# TTS: text → OGG/OPUS voice (gTTS + ffmpeg)
+# ---------------------------------------------------------------------------
+
 def _sanitize_text_for_tts(text):
-    """Makes text safe for gTTS: single line, no control chars."""
+    """Single line, no control chars, max MAX_TTS_CHARS."""
     if not text:
         return ""
     t = " ".join(str(text).split())
@@ -120,12 +117,13 @@ def _sanitize_text_for_tts(text):
 
 def _text_to_voice_ogg(text, speed):
     """
-    Converts text to OGG/OPUS voice file using gTTS and ffmpeg.
-    Returns path to temp .ogg file or None on error. Caller must delete the file.
+    Build temp .ogg with gTTS + ffmpeg (libopus).
+    Returns (path_ogg, None) on success, (None, error_message) on failure.
+    Caller must unlink path_ogg when done.
     """
     text = _sanitize_text_for_tts(text)
     if not text:
-        return None
+        return None, "empty text"
     try:
         from gtts import gTTS
         slow = speed == "slow"
@@ -133,67 +131,76 @@ def _text_to_voice_ogg(text, speed):
         os.close(fd_mp3)
         tts = gTTS(text=text, lang="en", slow=slow)
         tts.save(path_mp3)
+
         fd_ogg, path_ogg = tempfile.mkstemp(suffix=".ogg")
         os.close(fd_ogg)
-        ret = subprocess.run(
-            [
-                "ffmpeg", "-y", "-i", path_mp3,
-                "-acodec", "libopus", "-b:a", "64k",
-                path_ogg,
-            ],
-            capture_output=True,
-            timeout=60,
-        )
+        # On Windows use a single quoted command so PATH and paths with spaces work
+        if os.name == "nt":
+            cmd = f'ffmpeg -y -i "{path_mp3}" -acodec libopus -b:a 64k "{path_ogg}"'
+            ret = subprocess.run(cmd, shell=True, capture_output=True, timeout=60, text=False)
+        else:
+            ret = subprocess.run(
+                ["ffmpeg", "-y", "-i", path_mp3, "-acodec", "libopus", "-b:a", "64k", path_ogg],
+                capture_output=True,
+                timeout=60,
+            )
         try:
             os.unlink(path_mp3)
         except OSError:
             pass
         if ret.returncode != 0:
-            logger.warning("ffmpeg TTS conversion failed: %s", ret.stderr[:200] if ret.stderr else ret.returncode)
+            err = (ret.stderr or b"").decode("utf-8", errors="replace")[:300]
+            logger.warning("ffmpeg TTS failed (code=%s): %s", ret.returncode, err)
             try:
                 os.unlink(path_ogg)
             except OSError:
                 pass
-            return None
-        return path_ogg
-    except FileNotFoundError:
-        logger.warning("ffmpeg or gTTS not available; skipping voice reply")
-        return None
+            return None, err or f"ffmpeg exit code {ret.returncode}"
+        return path_ogg, None
+    except FileNotFoundError as e:
+        logger.warning("ffmpeg or gTTS not found: %s", e)
+        return None, "ffmpeg or gTTS not found"
     except Exception as e:
         logger.exception("TTS error: %s", e)
-        return None
+        return None, str(e)
 
 
 def send_voice_reply(bot, chat_id, text, speed):
-    """Sends a voice message with the given text (TTS). Called after each text reply."""
+    """Send one voice message (TTS). Returns True if sent, False if skipped or failed."""
     speed = speed or "normal"
-    path = _text_to_voice_ogg(text, speed)
+    text_for_voice = _sanitize_text_for_tts(text)[:MAX_VOICE_TTS_CHARS]
+    path, err = _text_to_voice_ogg(text_for_voice, speed)
+    if not path and text_for_voice:
+        path, err = _text_to_voice_ogg(text_for_voice[:300], speed)
     if not path:
-        # Retry with short snippet in case long/special text broke gTTS/ffmpeg
-        short = _sanitize_text_for_tts(text)[:500]
-        if short:
-            path = _text_to_voice_ogg(short, speed)
-        if not path:
-            logger.warning("TTS produced no file; skipping voice for chat_id=%s", chat_id)
-            return
+        logger.warning("TTS produced no file for chat_id=%s: %s", chat_id, err)
+        return False
     try:
         with open(path, "rb") as f:
-            bot.send_voice(chat_id, voice=f)
-        logger.info("Voice reply sent to chat_id=%s", chat_id)
-    except Exception as e:
-        logger.warning("Failed to send voice to chat_id=%s: %s", chat_id, e)
-    finally:
+            ogg_bytes = f.read()
         try:
             os.unlink(path)
         except OSError:
             pass
+        # Long timeout for uploading voice file (TTS can be 100–500 KB; slow links need time)
+        bot.send_voice(chat_id, voice=io.BytesIO(ogg_bytes), timeout=90)
+        logger.info("Voice reply sent to chat_id=%s", chat_id)
+        return True
+    except Exception as e:
+        logger.warning("Failed to send voice to chat_id=%s: %s", chat_id, e)
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return False
 
+
+# ---------------------------------------------------------------------------
+# ASR: download voice from Telegram → transcribe with Whisper
+# ---------------------------------------------------------------------------
 
 def _get_whisper_model():
-    """
-    Ленивая загрузка модели faster-whisper.
-    При первом вызове загружает модель в память (может занять время и ~140 MB для base).
-    """
+    """Lazy-load faster-whisper model (once per process)."""
     global _whisper_model
     if _whisper_model is None:
         try:
@@ -209,10 +216,7 @@ def _get_whisper_model():
 
 
 def download_voice_to_file(bot, file_id):
-    """
-    Скачивает голосовое сообщение из Telegram по file_id во временный .ogg файл.
-    Возвращает путь к файлу или None при ошибке. Вызывающий должен удалить файл после использования.
-    """
+    """Download voice to temp .ogg. Caller must unlink after use."""
     try:
         logger.debug("Скачивание голосового сообщения file_id=%s", file_id)
         file_info = bot.get_file(file_id)
@@ -230,11 +234,7 @@ def download_voice_to_file(bot, file_id):
 
 
 def transcribe_voice_file(audio_path):
-    """
-    Транскрибирует аудиофайл (ogg) в текст с помощью faster-whisper.
-    Удаляет временный файл после обработки.
-    Возвращает распознанный текст или None при ошибке/пустом результате.
-    """
+    """Transcribe .ogg to text (Whisper). Deletes audio_path in finally."""
     model = _get_whisper_model()
     if model is None:
         logger.warning("Модель Whisper недоступна, транскрипция пропущена")
@@ -262,11 +262,7 @@ def transcribe_voice_file(audio_path):
 
 
 def recognize_voice_message(bot, message):
-    """
-    Полный цикл: скачать голосовое из Telegram → распознать речь (Whisper) → вернуть текст.
-    Отправляет пользователю статусные сообщения («Распознаю речь...», ошибки).
-    Возвращает распознанный текст или None при ошибке.
-    """
+    """Download voice → transcribe → return text. Sends status/error messages to user."""
     file_id = message.voice.file_id
     chat_id = message.chat.id
     user_id = message.from_user.id
@@ -293,12 +289,12 @@ def recognize_voice_message(bot, message):
     return text
 
 
+# ---------------------------------------------------------------------------
+# Speaking Practice UI and session lifecycle
+# ---------------------------------------------------------------------------
+
 def show_speaking_menu(bot, message):
-    """
-    Показывает меню раздела Speaking Practice: начать практику, настройки скорости речи.
-    """
-    # В личных чатах user_id == chat_id; используем chat_id, чтобы не путать
-    # пользователя и самого бота (from_user у сообщений бота — это бот).
+    """Show Start practice / Speech speed; we use chat_id as user id for state."""
     user_id = message.chat.id
     logger.info("Показ меню Speaking Practice для user_id/chat_id=%s", user_id)
 
@@ -310,6 +306,7 @@ def show_speaking_menu(bot, message):
             "Speech speed settings", callback_data="speaking_speed_settings"
         )
     )
+    markup.add(types.InlineKeyboardButton("← Main menu", callback_data="restart"))
 
     bot.reply_to(
         message,
@@ -320,9 +317,7 @@ def show_speaking_menu(bot, message):
 
 
 def handle_speaking_callback(bot, call):
-    """
-    Обработчик callback-кнопок раздела Speaking: старт сессии, настройки скорости, завершение.
-    """
+    """Route: speaking_start, speaking_speed_*, speaking_end."""
     user_id = call.from_user.id
     data = call.data
     logger.info("Обработка speaking callback user_id=%s: %s", user_id, data)
@@ -340,29 +335,25 @@ def handle_speaking_callback(bot, call):
 
 
 def show_speed_settings(bot, message):
-    """
-    Показывает экран выбора скорости речи: медленно / обычно / быстро и кнопку «Назад».
-    """
-    user_id = message.from_user.id
-    logger.debug("Показ настроек скорости речи для user_id=%s", user_id)
-
+    """Show Slow / Normal / Fast and Back. Explains that speed affects voice (TTS) only."""
     markup = types.InlineKeyboardMarkup()
     for speed, name in SPEECH_SPEEDS.items():
         btn = types.InlineKeyboardButton(name, callback_data=f"speaking_speed_{speed}")
         markup.add(btn)
     markup.add(types.InlineKeyboardButton("← Back", callback_data="speaking"))
+    markup.add(types.InlineKeyboardButton("← Main menu", callback_data="restart"))
 
-    bot.reply_to(message, "Speech speed:", reply_markup=markup)
+    text = (
+        "Speech speed for voice messages:\n"
+        "• Slow = clearer, easier to follow\n"
+        "• Normal / Fast = quicker\n"
+        "Requires ffmpeg installed; otherwise you get text only."
+    )
+    bot.reply_to(message, text, reply_markup=markup)
 
 
 def start_speaking_practice(bot, message):
-    """
-    Запускает сессию Speaking Practice: создаёт запись в user_speaking_state,
-    отправляет приветствие и кнопки, при наличии GigaChat — первый ответ ИИ.
-    """
-    # Для идентификации пользователя в состоянии сессии используем chat_id.
-    # Это защищает от ситуации, когда from_user у сообщений, отправленных
-    # самим ботом, равен ID бота, а не пользователя.
+    """Create session in user_speaking_state, send welcome + buttons, first GigaChat reply if configured."""
     user_id = message.chat.id
     chat_id = message.chat.id
 
@@ -375,13 +366,11 @@ def start_speaking_practice(bot, message):
 
     welcome_text = (
         "Speaking practice started.\n"
-        "Send text or voice. I'll correct mistakes and reply with text and voice."
+        "Send text or voice. I'll reply with text and voice (voice needs ffmpeg installed)."
     )
     markup = types.InlineKeyboardMarkup()
-    markup.add(
-        types.InlineKeyboardButton("Speed settings", callback_data="speaking_speed_settings")
-    )
-    markup.add(types.InlineKeyboardButton("End session", callback_data="speaking_end"))
+    markup.add(types.InlineKeyboardButton("← Main menu", callback_data="speaking_end"))
+    markup.add(types.InlineKeyboardButton("Speed settings", callback_data="speaking_speed_settings"))
 
     bot.send_message(chat_id, welcome_text, reply_markup=markup)
 
@@ -416,10 +405,7 @@ def start_speaking_practice(bot, message):
 
 
 def end_speaking_practice(bot, message):
-    """
-    Завершает сессию Speaking Practice: удаляет состояние пользователя,
-    отправляет сообщение о завершении и главное меню.
-    """
+    """Drop session and send main menu (Vocabulary, Speaking, Progress, Settings)."""
     user_id = message.chat.id
     chat_id = message.chat.id
 
@@ -429,28 +415,16 @@ def end_speaking_practice(bot, message):
     else:
         logger.debug("Завершение сессии для user_id=%s — сессия не была активна", user_id)
 
+    from main import get_main_menu_markup
     bot.send_message(
         chat_id,
-        "Speaking practice session ended. Back to main menu.",
+        "Back to main menu.",
+        reply_markup=get_main_menu_markup(),
     )
-
-    markup = types.InlineKeyboardMarkup()
-    markup.add(
-        types.InlineKeyboardButton("VOCABULARY", callback_data="vocabulary"),
-        types.InlineKeyboardButton("SPEAKING PRACTICE", callback_data="speaking"),
-    )
-    markup.add(
-        types.InlineKeyboardButton("LEARNING PROGRESS", callback_data="progress"),
-        types.InlineKeyboardButton("SETTINGS", callback_data="settings"),
-    )
-    bot.send_message(chat_id, "Choose an action:", reply_markup=markup)
 
 
 def change_speech_speed(bot, message, speed):
-    """
-    Меняет сохранённую скорость речи для текущей сессии пользователя.
-    Действует только если сессия Speaking Practice уже начата.
-    """
+    """Update session speed; only works inside an active Speaking session."""
     user_id = message.chat.id
     chat_id = message.chat.id
 
@@ -464,12 +438,7 @@ def change_speech_speed(bot, message, speed):
 
 
 def handle_speaking_input(bot, message):
-    """
-    Обработчик входящих сообщений в режиме Speaking Practice (текст или голос).
-    Проверяет наличие активной сессии, для голоса вызывает распознавание, затем отправляет в GigaChat.
-    """
-    # Всегда используем chat_id как идентификатор пользователя внутри speaking-сессии,
-    # чтобы совпадали ID в callback-ах и обычных сообщениях.
+    """Handle text/voice: ensure session (auto-start if missing), then GigaChat + voice reply."""
     user_id = message.chat.id
     chat_id = message.chat.id
     content_type = message.content_type
@@ -482,15 +451,11 @@ def handle_speaking_input(bot, message):
     )
 
     if user_id not in user_speaking_state:
-        # Если по какой-то причине сессия ещё не создана (или была сброшена),
-        # автоматически запускаем Speaking Practice, чтобы не заставлять
-        # пользователя заново жать кнопки в меню.
+        # Auto-start session so user doesn't have to tap menu again
         logger.info(
             "Сообщение без активной сессии Speaking, авто-запуск. user_id=%s", user_id
         )
         start_speaking_practice(bot, message)
-        # Не продолжаем обработку текущего сообщения, чтобы не смешивать
-        # первый запрос (приветствие) и ответ пользователя.
         return
 
     if content_type == "voice":
@@ -523,10 +488,7 @@ def handle_speaking_input(bot, message):
 
 
 def simulate_gigachat_response(bot, user_id):
-    """
-    Заглушка ответа ИИ, когда GigaChat не настроен: отправляет фиксированную фразу
-    с учётом выбранной пользователем скорости речи.
-    """
+    """Fallback when GigaChat is not configured: fixed phrase + TTS."""
     state = user_speaking_state.get(user_id, {})
     chat_id = state.get("chat_id", user_id)
     speed = state.get("speed", "normal")
@@ -540,11 +502,12 @@ def simulate_gigachat_response(bot, user_id):
     send_voice_reply(bot, chat_id, response, speed)
 
 
+# ---------------------------------------------------------------------------
+# GigaChat API: build messages (system + history + user), send, append to history, reply + voice
+# ---------------------------------------------------------------------------
+
 def send_gigachat_response(bot, user_id, system_prompt, user_message, access_token):
-    """
-    Отправляет в GigaChat запрос с учётом истории диалога: system (промпт из файла) +
-    предыдущие пары user/assistant + новое сообщение пользователя. Ответ добавляется в историю.
-    """
+    """Request GigaChat with full context; send text + voice; append turn to conversation_history."""
     state = user_speaking_state.get(user_id, {})
     chat_id = state.get("chat_id", user_id)
     history = state.get("conversation_history", [])
@@ -589,10 +552,17 @@ def send_gigachat_response(bot, user_id, system_prompt, user_message, access_tok
             bot.send_message(chat_id, ai_message)
             speed = state.get("speed", "normal")
             try:
-                logger.debug("Sending voice reply for chat_id=%s, len=%s", chat_id, len(ai_message or ""))
-                send_voice_reply(bot, chat_id, ai_message, speed)
+                voice_ok = send_voice_reply(bot, chat_id, ai_message, speed)
+                if not voice_ok and not user_speaking_state.get(user_id, {}).get("voice_hint_sent"):
+                    bot.send_message(
+                        chat_id,
+                        "Voice not sent (install ffmpeg for voice replies).",
+                    )
+                    if user_id in user_speaking_state:
+                        user_speaking_state[user_id]["voice_hint_sent"] = True
             except Exception as voice_err:
                 logger.warning("Voice reply failed for chat_id=%s: %s", chat_id, voice_err)
+                bot.send_message(chat_id, "Voice not sent. Check server logs.")
 
             # Добавляем текущий обмен в историю, чтобы следующий запрос продолжал беседу
             if user_id in user_speaking_state:

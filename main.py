@@ -1,6 +1,10 @@
 """
-Точка входа Telegram-бота Seashell.
-Обрабатывает команды, callback-кнопки и передаёт голос/текст в модуль speaking_practice.
+Seashell Telegram bot — entry point.
+
+Flow:
+  1. /start, /restart → show main menu (Vocabulary, Speaking Practice, Restart, Settings).
+  2. Callbacks → route by callback_data to vocabulary, speaking_practice, restart, or settings.
+  3. Text/voice messages → if user is in "add word" (vocabulary) mode, save word; else handle as Speaking Practice input.
 """
 
 import os
@@ -9,7 +13,23 @@ import telebot
 from telebot import types
 from dotenv import load_dotenv
 
-# --- Настройка логирования ---
+
+def get_main_menu_markup():
+    """Single source for main menu buttons (no Learning progress)."""
+    markup = types.InlineKeyboardMarkup()
+    markup.add(
+        types.InlineKeyboardButton("VOCABULARY", callback_data="vocabulary"),
+        types.InlineKeyboardButton("SPEAKING PRACTICE", callback_data="speaking"),
+    )
+    markup.add(
+        types.InlineKeyboardButton("Restart", callback_data="restart"),
+        types.InlineKeyboardButton("SETTINGS", callback_data="settings"),
+    )
+    return markup
+
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.DEBUG,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -17,98 +37,105 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- Загрузка переменных окружения ---
-logger.info("Загрузка .env файла...")
-result = load_dotenv()
-logger.debug("Результат load_dotenv: %s", result)
-
-# Логируем наличие критичных переменных (без вывода самих значений из соображений безопасности)
-env_keys = ["TELEGRAM_BOT_TOKEN", "GIGACHAT_API_KEY", "GIGACHAT_MODEL_NAME"]
-for key in env_keys:
-    value = os.getenv(key)
-    logger.debug("%s: %s", key, "SET" if value else "NOT SET")
-
+# -----------------------------------------------------------------------------
+# Environment
+# -----------------------------------------------------------------------------
+load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GIGACHAT_API_KEY = os.getenv("GIGACHAT_API_KEY")
 GIGACHAT_MODEL_NAME = os.getenv("GIGACHAT_MODEL_NAME")
 
-logger.info("TELEGRAM_BOT_TOKEN загружен: %s", bool(TELEGRAM_BOT_TOKEN))
-logger.info("GIGACHAT_API_KEY загружен: %s", bool(GIGACHAT_API_KEY))
-logger.info("GIGACHAT_MODEL_NAME: %s", GIGACHAT_MODEL_NAME or "(не задан)")
+for key in ("TELEGRAM_BOT_TOKEN", "GIGACHAT_API_KEY", "GIGACHAT_MODEL_NAME"):
+    logger.debug("%s: %s", key, "SET" if os.getenv(key) else "NOT SET")
 
-# Проверка обязательного токена перед запуском бота
 if not TELEGRAM_BOT_TOKEN:
-    logger.critical("TELEGRAM_BOT_TOKEN отсутствует. Завершение.")
+    logger.critical("TELEGRAM_BOT_TOKEN missing. Exiting.")
     exit(1)
 
-# --- Инициализация бота ---
+# -----------------------------------------------------------------------------
+# Bot instance
+# -----------------------------------------------------------------------------
 try:
     bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
-    logger.info("Бот успешно инициализирован.")
+    import telebot.apihelper
+    telebot.apihelper.READ_TIMEOUT = 60
+    telebot.apihelper.CONNECT_TIMEOUT = 30
+    logger.info("Bot initialized.")
 except Exception as e:
-    logger.exception("Не удалось инициализировать бота: %s", e)
+    logger.exception("Failed to init bot: %s", e)
     exit(1)
 
+# -----------------------------------------------------------------------------
+# Database: create tables on startup (vocabulary)
+# -----------------------------------------------------------------------------
+try:
+    from db import init_db
+    init_db()
+except Exception as e:
+    logger.warning("DB init skipped or failed: %s", e)
 
-@bot.message_handler(commands=["start"])
+
+# -----------------------------------------------------------------------------
+# Handlers
+# -----------------------------------------------------------------------------
+
+@bot.message_handler(commands=["start", "restart"])
 def handle_start(message):
-    """
-    Обработчик команды /start.
-    Показывает главное меню с кнопками: словарь, speaking, прогресс, настройки.
-    """
-    user_id = message.from_user.id
-    logger.info("Команда /start от пользователя user_id=%s", user_id)
-
-    markup = types.InlineKeyboardMarkup()
-    btn_vocabulary = types.InlineKeyboardButton("VOCABULARY", callback_data="vocabulary")
-    btn_speaking = types.InlineKeyboardButton("SPEAKING PRACTICE", callback_data="speaking")
-    btn_progress = types.InlineKeyboardButton("LEARNING PROGRESS", callback_data="progress")
-    btn_settings = types.InlineKeyboardButton("SETTINGS", callback_data="settings")
-
-    markup.add(btn_vocabulary, btn_speaking)
-    markup.add(btn_progress, btn_settings)
-
-    bot.reply_to(message, "Welcome. Choose an action:", reply_markup=markup)
-    logger.debug("Главное меню отправлено пользователю user_id=%s", user_id)
+    """Show main menu (Vocabulary, Speaking, Restart, Settings)."""
+    logger.info("%s from user_id=%s", message.text or "/start", message.from_user.id)
+    bot.reply_to(message, "Welcome. Choose an action:", reply_markup=get_main_menu_markup())
 
 
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callback(call):
     """
-    Обработчик нажатий на inline-кнопки.
-    Маршрутизирует по callback_data: vocabulary, speaking, progress, settings, speaking_*.
+    Route by callback_data:
+      vocabulary, vocab_* → vocabulary module
+      speaking, speaking_* → speaking_practice module
+      progress, settings → placeholder text
     """
-    user_id = call.from_user.id
-    callback_data = call.data
-    logger.info("Callback от user_id=%s: %s", user_id, callback_data)
+    data = call.data
+    logger.info("Callback user_id=%s data=%s", call.from_user.id, data)
 
-    if callback_data == "vocabulary":
-        logger.debug("Открытие раздела Vocabulary для user_id=%s", user_id)
-        bot.edit_message_text(
-            "Vocabulary section is loading. Preparing materials...",
-            call.message.chat.id,
-            call.message.message_id,
-        )
-    elif callback_data == "speaking":
-        logger.debug("Открытие раздела Speaking для user_id=%s", user_id)
+    if data == "vocabulary":
+        bot.answer_callback_query(call.id)
+        from vocabulary import show_vocabulary_menu
+        show_vocabulary_menu(bot, call.message)
+        return
+
+    if data.startswith("vocab_"):
+        from vocabulary import handle_vocabulary_callback
+        handle_vocabulary_callback(bot, call)
+        return
+
+    if data == "speaking":
+        bot.answer_callback_query(call.id)
         from speaking_practice import show_speaking_menu
         show_speaking_menu(bot, call.message)
-    elif callback_data == "progress":
-        logger.debug("Открытие раздела Progress для user_id=%s", user_id)
-        bot.edit_message_text(
-            "Your learning progress.",
+        return
+
+    if data == "restart":
+        bot.answer_callback_query(call.id)
+        from vocabulary import cancel_add_word_mode
+        cancel_add_word_mode(call.message.chat.id)
+        bot.send_message(
             call.message.chat.id,
-            call.message.message_id,
+            "Welcome. Choose an action:",
+            reply_markup=get_main_menu_markup(),
         )
-    elif callback_data == "settings":
-        logger.debug("Открытие раздела Settings для user_id=%s", user_id)
-        bot.edit_message_text(
+        return
+
+    if data == "settings":
+        bot.answer_callback_query(call.id)
+        bot.send_message(
+            call.message.chat.id,
             "App settings.",
-            call.message.chat.id,
-            call.message.message_id,
+            reply_markup=get_main_menu_markup(),
         )
-    elif callback_data.startswith("speaking_"):
-        logger.debug("Обработка speaking-callback для user_id=%s: %s", user_id, callback_data)
+        return
+
+    if data.startswith("speaking_"):
+        bot.answer_callback_query(call.id)
         from speaking_practice import handle_speaking_callback
         handle_speaking_callback(bot, call)
 
@@ -116,22 +143,32 @@ def handle_callback(call):
 @bot.message_handler(content_types=["voice", "text"])
 def handle_all_messages(message):
     """
-    Обработчик текстовых и голосовых сообщений.
-    Вся логика (проверка сессии, распознавание, GigaChat) делегируется speaking_practice.
+    Text/voice: if user is in Vocabulary "add word" flow, save word and exit.
+    Otherwise pass to Speaking Practice (session check and GigaChat/voice there).
     """
-    user_id = message.from_user.id
+    chat_id = message.chat.id
     content_type = message.content_type
-    logger.info("Сообщение от user_id=%s, content_type=%s", user_id, content_type)
+    logger.info("Message chat_id=%s content_type=%s", chat_id, content_type)
+
+    # Vocabulary "add word" mode: next text is saved as a word
+    if content_type == "text":
+        from vocabulary import is_adding_word, consume_add_word
+        if is_adding_word(chat_id):
+            consume_add_word(bot, chat_id, message.text)
+            return
 
     from speaking_practice import handle_speaking_input
     handle_speaking_input(bot, message)
 
 
+# -----------------------------------------------------------------------------
+# Run
+# -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    logger.info("Запуск long polling бота...")
+    logger.info("Starting polling.")
     try:
         bot.infinity_polling()
     except KeyboardInterrupt:
-        logger.info("Бот остановлен пользователем (Ctrl+C).")
+        logger.info("Stopped by user.")
     except Exception as e:
-        logger.exception("Критическая ошибка при работе бота: %s", e)
+        logger.exception("Fatal: %s", e)

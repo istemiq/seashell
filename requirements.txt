@@ -4,3 +4,4 @@ requests==2.31.0
 urllib3~=2.6.3
 faster-whisper>=1.0.0
 gtts>=2.4.0
+psycopg2-binary>=2.9.0
