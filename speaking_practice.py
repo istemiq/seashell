@@ -1,11 +1,35 @@
 """
-Speaking Practice: voice/text chat with an AI coach (GigaChat).
+Speaking Practice feature (chat with AI + optional voice).
 
-Logic:
-  - Menu: start practice, speech speed settings, end session.
-  - State: user_speaking_state[chat_id] = { speed, conversation_history, chat_id }.
-  - Incoming voice → download, transcribe (Whisper), then same path as text.
-  - Incoming text → build messages from system prompt + history + new message → GigaChat → reply text + TTS voice.
+What this module does:
+  - Shows the Speaking Practice menu (start session, speed settings).
+  - Keeps an in-memory "session" per chat_id (history + chosen voice speed).
+  - Handles text input:
+      user text -> send to GigaChat -> send AI reply as text + voice (TTS)
+  - Handles voice input:
+      user voice -> download from Telegram -> transcribe with Whisper -> same path as text
+
+Important notes:
+  - Session state is stored in RAM (`user_speaking_state`).
+    If the bot restarts, sessions are lost (this is OK for now).
+  - Voice replies use gTTS + ffmpeg, so ffmpeg must be installed and in PATH.
+  - We keep voice TTS short (MAX_VOICE_TTS_CHARS) so it is fast and reliable.
+
+FAQ:
+  Q: Why does voice sometimes not send, but text sends?
+  A: Voice needs gTTS + ffmpeg + network. If ffmpeg is missing or Telegram upload is slow,
+     we can still send plain text.
+
+  Q: Why do you limit voice length (MAX_VOICE_TTS_CHARS)?
+  A: gTTS makes multiple web requests for long text; that is slow and error-prone.
+     Short voice is faster and more reliable.
+
+  Q: Why do you disable SSL verification for GigaChat requests?
+  A: This was done to avoid certificate issues in some environments. For production you should
+     enable verification (verify=True) and install correct CA certificates.
+
+  Q: Where is the system prompt for the AI?
+  A: In `prompts/speaking_intermediate.txt` loaded by `read_prompt()`.
 """
 
 import os
@@ -21,7 +45,7 @@ import uuid
 
 logger = logging.getLogger(__name__)
 
-# Whisper: loaded on first voice message
+# Whisper ASR model is loaded only when we first need it (lazy-load).
 _whisper_model = None
 WHISPER_MODEL_SIZE = "base"
 WHISPER_LANGUAGE = "en"
@@ -31,12 +55,17 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 GIGACHAT_API_KEY = os.getenv("GIGACHAT_API_KEY")
 GIGACHAT_MODEL_NAME = os.getenv("GIGACHAT_MODEL_NAME")
 
-# Active sessions: chat_id -> { speed, conversation_history, chat_id }
+# Active sessions (in-memory):
+# chat_id -> dict with:
+#   - speed: "slow" | "normal" | "fast"
+#   - conversation_history: list of messages (role/content)
+#   - chat_id: redundant but convenient
 user_speaking_state = {}
 
 SPEECH_SPEEDS = {"slow": "Slow", "normal": "Normal", "fast": "Fast"}
 
-# Keep last N messages in history for API context window
+# Keep last N history messages sent to the AI.
+# (Token usage grows with history length.)
 MAX_HISTORY_MESSAGES = 20
 MAX_TTS_CHARS = 4000
 # Shorter text for voice = fewer gTTS requests and faster upload
@@ -134,7 +163,7 @@ def _text_to_voice_ogg(text, speed):
 
         fd_ogg, path_ogg = tempfile.mkstemp(suffix=".ogg")
         os.close(fd_ogg)
-        # On Windows use a single quoted command so PATH and paths with spaces work
+    # On Windows we call ffmpeg via shell so PATH works and spaces in paths are handled.
         if os.name == "nt":
             cmd = f'ffmpeg -y -i "{path_mp3}" -acodec libopus -b:a 64k "{path_ogg}"'
             ret = subprocess.run(cmd, shell=True, capture_output=True, timeout=60, text=False)
@@ -168,6 +197,9 @@ def _text_to_voice_ogg(text, speed):
 def send_voice_reply(bot, chat_id, text, speed):
     """Send one voice message (TTS). Returns True if sent, False if skipped or failed."""
     speed = speed or "normal"
+    # We intentionally limit voice text length:
+    # - gTTS splits text and performs multiple HTTP requests for long messages
+    # - long voice uploads are more likely to hit network timeouts
     text_for_voice = _sanitize_text_for_tts(text)[:MAX_VOICE_TTS_CHARS]
     path, err = _text_to_voice_ogg(text_for_voice, speed)
     if not path and text_for_voice:

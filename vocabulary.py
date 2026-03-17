@@ -1,13 +1,41 @@
 """
-Vocabulary module: user word list (stub UI + PostgreSQL).
+Vocabulary feature (save words -> study them -> get examples + audio).
 
-Flow:
-  - VOCABULARY from main menu → show_vocabulary_menu (My words / Add word / Back).
-  - My words → list from db.get_words(chat_id); Back returns to this menu.
-  - Add word → set _vocab_add_state; next text message is saved via consume_add_word (word or "word — meaning").
-  - Back → return to main menu (same inline buttons as main.py).
+What user can do:
+  - Add a word (optionally with meaning/translation)
+  - Browse the list of saved words (paginated)
+  - Open a "word card" (Study / Delete)
+  - Study a word:
+      - bot shows one example sentence
+      - bot also sends audio for that example (TTS)
+      - examples are cached in DB in batches (up to 10) to save tokens
 
-Callbacks handled: vocab_list, vocab_add, vocab_back. "vocabulary" is handled in main and calls show_vocabulary_menu.
+How Telegram UI maps to our code:
+  - Every inline button sends `callback_data` back to the bot.
+  - This module "owns" callback_data that starts with `vocab_...`
+  - `main.py` routes those callbacks here: `handle_vocabulary_callback`.
+
+Persistence:
+  - `db.py` uses PostgreSQL if DATABASE_URL is set.
+  - otherwise it uses a local SQLite file `seashell.db` (fallback).
+
+FAQ:
+  Q: I pressed "Add word". Why does the bot start waiting for my next message?
+  A: We put your chat_id into `_vocab_add_state`. The next text message is saved as a word.
+
+  Q: Why do you cache up to 10 examples but show only one?
+  A: Token economy. One AI call generates a batch. Then "Next example" uses DB cache.
+
+  Q: What does "Refresh example" do?
+  A: It behaves like "next": it uses cache first. If cache is empty, it generates a new batch.
+
+  Q: Where is the translation shown?
+  A: In the word card: `MEANING:`. If it's empty, we auto-translate using your native language
+     from Settings and store the result to DB.
+
+  Q: Why can examples fail to generate?
+  A: If GIGACHAT_API_KEY / model is missing or the network is down, `_generate_examples_via_ai()`
+     returns an empty list and you will see an error message.
 """
 
 import logging
@@ -22,20 +50,31 @@ from db import (
     pop_next_example,
     count_unserved_examples,
     add_examples_batch,
+    get_native_language,
+    update_word_meaning,
 )
 
 logger = logging.getLogger(__name__)
 
-# Chat IDs that are in "add word" mode; next text message is stored as a word.
+# In-memory state (NOT persisted):
+# - if chat_id is in this set, the next text message is treated as a "new word" input.
 _vocab_add_state = set()
 
-# Simple per-chat UI state for study screen navigation
+# In-memory state for study screen:
+# - remembers which word_id user is currently studying.
 _study_word_by_chat = {}
 
 WORDS_PER_PAGE = 10
 
 
 def _show_words_page(bot, chat_id: int, message_id: int, page: int):
+    """
+    Render one page of the "My words" list as inline keyboard buttons.
+
+    Why "buttons per word" instead of a big text list:
+      - user can tap a word directly
+      - we get the word_id in callback_data and can open the word card
+    """
     if page < 0:
         page = 0
 
@@ -45,6 +84,7 @@ def _show_words_page(bot, chat_id: int, message_id: int, page: int):
 
     markup = types.InlineKeyboardMarkup()
     if not words:
+        # Empty state: user has no words yet.
         markup.add(types.InlineKeyboardButton("← Back", callback_data="vocab_menu"))
         markup.add(types.InlineKeyboardButton("Main menu", callback_data="restart"))
         bot.edit_message_text(
@@ -59,6 +99,7 @@ def _show_words_page(bot, chat_id: int, message_id: int, page: int):
     words = words[:WORDS_PER_PAGE]
 
     for (word_id, word, meaning, _) in words:
+        # Button label is short; callback_data contains the word_id (DB primary key).
         label = word if not meaning else f"{word} — {meaning}"
         if len(label) > 50:
             label = label[:47] + "..."
@@ -84,8 +125,8 @@ def _show_words_page(bot, chat_id: int, message_id: int, page: int):
 
 def show_vocabulary_menu(bot, message):
     """
-    Entry point: show Vocabulary menu (stub).
-    Called from main when user taps VOCABULARY.
+    Entry point: show Vocabulary home menu.
+    Called from `main.py` when user taps the main menu button "VOCABULARY".
     """
     chat_id = message.chat.id
     logger.info("Showing vocabulary menu for chat_id=%s", chat_id)
@@ -102,7 +143,17 @@ def show_vocabulary_menu(bot, message):
 
 def handle_vocabulary_callback(bot, call):
     """
-    Route callback_data: vocab_list, vocab_add, vocab_back, vocab_menu.
+    Router for the whole vocabulary UI.
+
+    All callback_data values this function handles start with:
+      - vocab_...
+    Examples:
+      - vocab_list
+      - vocab_list_p1
+      - vocab_word_123
+      - vocab_study_123
+      - vocab_next_example
+      - vocab_refresh_example
     """
     chat_id = call.message.chat.id
     data = call.data
@@ -110,11 +161,13 @@ def handle_vocabulary_callback(bot, call):
     bot.answer_callback_query(call.id)
 
     if data == "vocab_back":
+        # Back from Vocabulary feature to global main menu.
         from main import get_main_menu_markup
         bot.send_message(chat_id, "Choose an action:", reply_markup=get_main_menu_markup())
         return
 
     if data == "vocab_menu":
+        # Vocabulary "home" screen; also cancels add-word mode.
         _vocab_add_state.discard(chat_id)
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton("My words", callback_data="vocab_list"))
@@ -130,10 +183,12 @@ def handle_vocabulary_callback(bot, call):
         return
 
     if data == "vocab_list":
+        # Page 0 of saved words.
         _show_words_page(bot, chat_id, call.message.message_id, page=0)
         return
 
     if data.startswith("vocab_list_p"):
+        # Pagination: `vocab_list_pN` where N is page index.
         try:
             page = int(data.split("p", 1)[1])
         except Exception:
@@ -142,6 +197,7 @@ def handle_vocabulary_callback(bot, call):
         return
 
     if data.startswith("vocab_word_"):
+        # Open a word card (Study/Delete) for a specific word_id.
         try:
             word_id = int(data.split("_")[2])
         except Exception:
@@ -152,6 +208,15 @@ def handle_vocabulary_callback(bot, call):
             bot.send_message(chat_id, "Word not found (maybe deleted).")
             return
         _, word, meaning, _ = row
+        if not meaning:
+            # If translation/meaning is missing, generate it automatically
+            # using the user's native language from Settings.
+            native_lang = get_native_language(chat_id)
+            translated = _translate_word_via_ai(word, native_lang)
+            if translated:
+                meaning = translated
+                # Persist translation so we don't spend tokens next time.
+                update_word_meaning(chat_id, word_id, translated)
 
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton("Study", callback_data=f"vocab_study_{word_id}"))
@@ -166,6 +231,7 @@ def handle_vocabulary_callback(bot, call):
         return
 
     if data.startswith("vocab_delete_") and not data.startswith("vocab_delete_confirm_"):
+        # Delete flow step 1: show confirmation prompt.
         try:
             word_id = int(data.split("_")[2])
         except Exception:
@@ -187,6 +253,7 @@ def handle_vocabulary_callback(bot, call):
         return
 
     if data.startswith("vocab_delete_confirm_"):
+        # Delete flow step 2: user confirmed.
         try:
             word_id = int(data.split("_")[3])
         except Exception:
@@ -198,16 +265,19 @@ def handle_vocabulary_callback(bot, call):
         return
 
     if data.startswith("vocab_study_"):
+        # Enter study mode for a word_id.
         try:
             word_id = int(data.split("_")[2])
         except Exception:
             bot.send_message(chat_id, "Invalid word id.")
             return
         _study_word_by_chat[chat_id] = word_id
+        # Serve first example: uses cache if present, otherwise generates a new batch.
         _show_next_study_example(bot, chat_id, call.message, force_refresh=False)
         return
 
     if data == "vocab_next_example":
+        # Serve next cached example (generates new batch only if cache is empty).
         word_id = _study_word_by_chat.get(chat_id)
         if not word_id:
             bot.send_message(chat_id, "No active word. Pick a word first.")
@@ -216,6 +286,9 @@ def handle_vocabulary_callback(bot, call):
         return
 
     if data == "vocab_refresh_example":
+        # Token-saving behavior:
+        # - If cache is not empty -> just serve next cached example
+        # - If cache is empty -> generate a new batch and serve from it
         word_id = _study_word_by_chat.get(chat_id)
         if not word_id:
             bot.send_message(chat_id, "No active word. Pick a word first.")
@@ -225,6 +298,7 @@ def handle_vocabulary_callback(bot, call):
         return
 
     if data == "vocab_add":
+        # Enter "add word" mode: next text message will be saved as vocabulary.
         _vocab_add_state.add(chat_id)
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton("Cancel", callback_data="vocab_menu"))
@@ -262,7 +336,7 @@ def consume_add_word(bot, chat_id, text: str) -> bool:
         bot.send_message(chat_id, "Empty message. Word not added.")
         return True
 
-    # Optional: "word — meaning"
+    # Optional input format: "word — meaning" (dash is ' — ').
     word, meaning = part, None
     if " — " in part:
         word, _, meaning = part.partition(" — ")
@@ -299,13 +373,17 @@ def _show_next_study_example(
         return
     _, word, meaning, _ = row
 
+    # How many cached examples we have BEFORE consuming one.
     remaining_before = count_unserved_examples(chat_id, word_id)
     if force_refresh:
         picked = None
     else:
+        # Consume one cached example (mark as served in DB).
         picked = pop_next_example(chat_id, word_id)
 
     if picked is None and generate_if_empty:
+        # Cache is empty: ask the AI to generate a batch (up to 10),
+        # store them in DB, then pop the first one.
         examples = _generate_examples_via_ai(word, meaning, count=10)
         if examples:
             add_examples_batch(chat_id, word_id, examples)
@@ -338,6 +416,7 @@ def _show_next_study_example(
     # Send audio (gTTS+ffmpeg pipeline from speaking_practice)
     try:
         from speaking_practice import send_voice_reply
+        # Always normal speed for vocabulary examples.
         send_voice_reply(bot, chat_id, example_text, speed="normal")
     except Exception as e:
         logger.warning("Failed to send example audio: %s", e)
@@ -419,3 +498,50 @@ def _generate_examples_via_ai(word: str, meaning: str | None, count: int = 10) -
     except Exception as e:
         logger.exception("generate_examples failed: %s", e)
         return []
+
+
+def _translate_word_via_ai(word: str, native_lang: str) -> str | None:
+    """Translate a single word into user's native language. Returns short translation."""
+    try:
+        import os
+        import requests
+        from speaking_practice import get_access_token
+
+        api_key = os.getenv("GIGACHAT_API_KEY")
+        model = os.getenv("GIGACHAT_MODEL_NAME")
+        if not api_key or not model:
+            return None
+
+        access_token = get_access_token()
+        if not access_token:
+            return None
+
+        system_prompt = (
+            "You are a translator. Return ONLY the translation, no extra words.\n"
+            "If there are multiple common translations, separate them with '; '.\n"
+            "Keep it short."
+        )
+        user_prompt = f"Translate this English word to language '{native_lang}': {word}"
+
+        headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+        data = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.2,
+            "max_tokens": 60,
+        }
+        url = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions"
+        resp = requests.post(url, headers=headers, json=data, timeout=30, verify=False)
+        if resp.status_code != 200:
+            return None
+        content = (resp.json()["choices"][0]["message"]["content"] or "").strip()
+        if not content:
+            return None
+        # One line only
+        return content.splitlines()[0].strip()[:120]
+    except Exception as e:
+        logger.warning("translate_word failed: %s", e)
+        return None
