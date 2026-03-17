@@ -118,6 +118,12 @@ def handle_callback(call):
         bot.answer_callback_query(call.id)
         from vocabulary import cancel_add_word_mode
         cancel_add_word_mode(call.message.chat.id)
+        # Also drop active Speaking session, if any
+        try:
+            from speaking_practice import user_speaking_state
+            user_speaking_state.pop(call.message.chat.id, None)
+        except Exception:
+            pass
         bot.send_message(
             call.message.chat.id,
             "Welcome. Choose an action:",

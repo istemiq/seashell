@@ -306,7 +306,10 @@ def show_speaking_menu(bot, message):
             "Speech speed settings", callback_data="speaking_speed_settings"
         )
     )
-    markup.add(types.InlineKeyboardButton("← Main menu", callback_data="restart"))
+    markup.add(
+        types.InlineKeyboardButton("← Back", callback_data="restart"),
+        types.InlineKeyboardButton("Main menu", callback_data="restart"),
+    )
 
     bot.reply_to(
         message,
