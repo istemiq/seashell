@@ -46,6 +46,7 @@ import logging
 from contextlib import contextmanager
 import uuid
 from pathlib import Path
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -159,6 +160,48 @@ def init_db():
                 )
                 """
             )
+            # --- Product/UX state ---
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_profiles (
+                    user_id INTEGER PRIMARY KEY,
+                    onboarding_done INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT DEFAULT (datetime('now'))
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS speaking_sessions (
+                    user_id INTEGER PRIMARY KEY,
+                    speed TEXT NOT NULL DEFAULT 'normal',
+                    history_json TEXT NOT NULL,
+                    updated_at TEXT DEFAULT (datetime('now'))
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS usage_stats (
+                    user_id INTEGER PRIMARY KEY,
+                    words_added INTEGER NOT NULL DEFAULT 0,
+                    examples_generated INTEGER NOT NULL DEFAULT 0,
+                    examples_served INTEGER NOT NULL DEFAULT 0,
+                    speaking_turns INTEGER NOT NULL DEFAULT 0,
+                    speaking_recaps INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT DEFAULT (datetime('now'))
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS vocab_active_session (
+                    user_id INTEGER PRIMARY KEY,
+                    word_id INTEGER,
+                    updated_at TEXT DEFAULT (datetime('now'))
+                )
+                """
+            )
         else:
             # PostgreSQL schema.
             with conn.cursor() as cur:
@@ -193,6 +236,39 @@ def init_db():
                     CREATE TABLE IF NOT EXISTS user_settings (
                         user_id BIGINT PRIMARY KEY,
                         native_language TEXT NOT NULL DEFAULT 'ru'
+                    );
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS user_profiles (
+                        user_id BIGINT PRIMARY KEY,
+                        onboarding_done INTEGER NOT NULL DEFAULT 0,
+                        created_at TIMESTAMPTZ DEFAULT NOW()
+                    );
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS speaking_sessions (
+                        user_id BIGINT PRIMARY KEY,
+                        speed TEXT NOT NULL DEFAULT 'normal',
+                        history_json TEXT NOT NULL,
+                        updated_at TIMESTAMPTZ DEFAULT NOW()
+                    );
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS usage_stats (
+                        user_id BIGINT PRIMARY KEY,
+                        words_added INTEGER NOT NULL DEFAULT 0,
+                        examples_generated INTEGER NOT NULL DEFAULT 0,
+                        examples_served INTEGER NOT NULL DEFAULT 0,
+                        speaking_turns INTEGER NOT NULL DEFAULT 0,
+                        speaking_recaps INTEGER NOT NULL DEFAULT 0,
+                        updated_at TIMESTAMPTZ DEFAULT NOW()
+                    );
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS vocab_active_session (
+                        user_id BIGINT PRIMARY KEY,
+                        word_id INT,
+                        updated_at TIMESTAMPTZ DEFAULT NOW()
                     );
                 """)
         logger.info("Database schema checked (vocabulary table).")
@@ -574,3 +650,367 @@ def count_unserved_examples(user_id: int, word_id: int) -> int:
     except Exception as e:
         logger.exception("count_unserved_examples failed: %s", e)
         return 0
+
+
+# ---------------------------------------------------------------------------
+# UX/product state: onboarding + usage stats
+# ---------------------------------------------------------------------------
+
+
+def is_onboarding_done(user_id: int) -> bool:
+    """Return True if user finished onboarding."""
+    try:
+        with get_connection() as conn:
+            if conn is None:
+                return False
+            is_sqlite = conn.__class__.__module__.startswith("sqlite3")
+            if is_sqlite:
+                cur = conn.cursor()
+                cur.execute(
+                    "INSERT OR IGNORE INTO user_profiles (user_id, onboarding_done) VALUES (?, 0)",
+                    (user_id,),
+                )
+                cur.execute(
+                    "SELECT onboarding_done FROM user_profiles WHERE user_id = ?",
+                    (user_id,),
+                )
+                row = cur.fetchone()
+                return bool(row[0]) if row else False
+            else:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO user_profiles (user_id, onboarding_done)
+                        VALUES (%s, 0)
+                        ON CONFLICT (user_id) DO NOTHING
+                        """,
+                        (user_id,),
+                    )
+                    cur.execute(
+                        "SELECT onboarding_done FROM user_profiles WHERE user_id = %s",
+                        (user_id,),
+                    )
+                    row = cur.fetchone()
+                    return bool(row[0]) if row else False
+    except Exception as e:
+        logger.exception("is_onboarding_done failed: %s", e)
+        return False
+
+
+def set_onboarding_done(user_id: int, done: bool = True) -> bool:
+    """Mark onboarding as done/undone."""
+    try:
+        with get_connection() as conn:
+            if conn is None:
+                return False
+            is_sqlite = conn.__class__.__module__.startswith("sqlite3")
+            v = 1 if done else 0
+            if is_sqlite:
+                cur = conn.cursor()
+                cur.execute(
+                    "INSERT OR IGNORE INTO user_profiles (user_id, onboarding_done) VALUES (?, 0)",
+                    (user_id,),
+                )
+                cur.execute(
+                    "UPDATE user_profiles SET onboarding_done = ? WHERE user_id = ?",
+                    (v, user_id),
+                )
+                return cur.rowcount > 0
+            else:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO user_profiles (user_id, onboarding_done)
+                        VALUES (%s, 0)
+                        ON CONFLICT (user_id) DO NOTHING
+                        """,
+                        (user_id,),
+                    )
+                    cur.execute(
+                        "UPDATE user_profiles SET onboarding_done = %s WHERE user_id = %s",
+                        (v, user_id),
+                    )
+                    return cur.rowcount > 0
+    except Exception as e:
+        logger.exception("set_onboarding_done failed: %s", e)
+        return False
+
+
+_USAGE_FIELDS = {
+    "words_added",
+    "examples_generated",
+    "examples_served",
+    "speaking_turns",
+    "speaking_recaps",
+}
+
+
+def increment_usage(user_id: int, field: str, amount: int = 1) -> bool:
+    """Increment a usage counter (safe field names only)."""
+    if field not in _USAGE_FIELDS:
+        return False
+    try:
+        with get_connection() as conn:
+            if conn is None:
+                return False
+            is_sqlite = conn.__class__.__module__.startswith("sqlite3")
+            amount = int(amount)
+            if amount == 0:
+                return True
+
+            if is_sqlite:
+                cur = conn.cursor()
+                cur.execute("INSERT OR IGNORE INTO usage_stats (user_id) VALUES (?)", (user_id,))
+                cur.execute(
+                    f"UPDATE usage_stats SET {field} = {field} + ? WHERE user_id = ?",
+                    (amount, user_id),
+                )
+                return cur.rowcount > 0
+            else:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO usage_stats (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING",
+                        (user_id,),
+                    )
+                    cur.execute(
+                        f"UPDATE usage_stats SET {field} = {field} + %s WHERE user_id = %s",
+                        (amount, user_id),
+                    )
+                    return cur.rowcount > 0
+    except Exception as e:
+        logger.exception("increment_usage failed: %s", e)
+        return False
+
+
+def get_usage_stats(user_id: int) -> dict:
+    """Get usage counters as a dict."""
+    try:
+        with get_connection() as conn:
+            if conn is None:
+                return {}
+            is_sqlite = conn.__class__.__module__.startswith("sqlite3")
+            if is_sqlite:
+                cur = conn.cursor()
+                cur.execute("INSERT OR IGNORE INTO usage_stats (user_id) VALUES (?)", (user_id,))
+                cur.execute(
+                    """
+                    SELECT words_added, examples_generated, examples_served,
+                           speaking_turns, speaking_recaps
+                    FROM usage_stats WHERE user_id = ?
+                    """,
+                    (user_id,),
+                )
+                row = cur.fetchone()
+            else:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO usage_stats (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING",
+                        (user_id,),
+                    )
+                    cur.execute(
+                        """
+                        SELECT words_added, examples_generated, examples_served,
+                               speaking_turns, speaking_recaps
+                        FROM usage_stats WHERE user_id = %s
+                        """,
+                        (user_id,),
+                    )
+                    row = cur.fetchone()
+            if not row:
+                return {}
+            return {
+                "words_added": int(row[0]),
+                "examples_generated": int(row[1]),
+                "examples_served": int(row[2]),
+                "speaking_turns": int(row[3]),
+                "speaking_recaps": int(row[4]),
+            }
+    except Exception as e:
+        logger.exception("get_usage_stats failed: %s", e)
+        return {}
+
+
+# ---------------------------------------------------------------------------
+# Persistent Speaking session (survives bot restarts)
+# ---------------------------------------------------------------------------
+
+
+def get_speaking_session(user_id: int):
+    """
+    Load persisted speaking session.
+    Returns dict: {speed: str, conversation_history: list[{"role","content"}]}
+    or None if no session.
+    """
+    try:
+        with get_connection() as conn:
+            if conn is None:
+                return None
+            is_sqlite = conn.__class__.__module__.startswith("sqlite3")
+            if is_sqlite:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT speed, history_json FROM speaking_sessions WHERE user_id = ?",
+                    (user_id,),
+                )
+                row = cur.fetchone()
+            else:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT speed, history_json FROM speaking_sessions WHERE user_id = %s",
+                        (user_id,),
+                    )
+                    row = cur.fetchone()
+            if not row:
+                return None
+            speed = row[0] or "normal"
+            history_json = row[1] or "[]"
+            try:
+                history = json.loads(history_json)
+            except Exception:
+                history = []
+            return {"speed": speed, "conversation_history": history}
+    except Exception as e:
+        logger.exception("get_speaking_session failed: %s", e)
+        return None
+
+
+def set_speaking_session(user_id: int, speed: str, conversation_history: list):
+    """Persist current speaking session to DB."""
+    try:
+        speed = (speed or "normal").strip()
+        history_json = json.dumps(conversation_history or [])
+        with get_connection() as conn:
+            if conn is None:
+                return False
+            is_sqlite = conn.__class__.__module__.startswith("sqlite3")
+            if is_sqlite:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    INSERT INTO speaking_sessions (user_id, speed, history_json)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(user_id) DO UPDATE SET
+                      speed = excluded.speed,
+                      history_json = excluded.history_json,
+                      updated_at = datetime('now')
+                    """,
+                    (user_id, speed, history_json),
+                )
+                return True
+            else:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO speaking_sessions (user_id, speed, history_json)
+                        VALUES (%s, %s, %s)
+                        ON CONFLICT(user_id) DO UPDATE SET
+                          speed = EXCLUDED.speed,
+                          history_json = EXCLUDED.history_json,
+                          updated_at = NOW()
+                        """,
+                        (user_id, speed, history_json),
+                    )
+                    return True
+    except Exception as e:
+        logger.exception("set_speaking_session failed: %s", e)
+        return False
+
+
+def clear_speaking_session(user_id: int) -> bool:
+    """Delete persisted speaking session."""
+    try:
+        with get_connection() as conn:
+            if conn is None:
+                return False
+            is_sqlite = conn.__class__.__module__.startswith("sqlite3")
+            if is_sqlite:
+                cur = conn.cursor()
+                cur.execute("DELETE FROM speaking_sessions WHERE user_id = ?", (user_id,))
+                return cur.rowcount > 0
+            else:
+                with conn.cursor() as cur:
+                    cur.execute("DELETE FROM speaking_sessions WHERE user_id = %s", (user_id,))
+                    return cur.rowcount > 0
+    except Exception as e:
+        logger.exception("clear_speaking_session failed: %s", e)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Persistent Vocabulary study state (helps after bot restart)
+# ---------------------------------------------------------------------------
+
+
+def set_vocab_active_word(user_id: int, word_id: int | None) -> bool:
+    """
+    Store which word is currently opened in "study" mode for the user.
+    Used only as a UX improvement after restarts.
+    """
+    try:
+        with get_connection() as conn:
+            if conn is None:
+                return False
+            is_sqlite = conn.__class__.__module__.startswith("sqlite3")
+            if is_sqlite:
+                cur = conn.cursor()
+                if word_id is None:
+                    cur.execute("UPDATE vocab_active_session SET word_id = NULL WHERE user_id = ?", (user_id,))
+                    if cur.rowcount == 0:
+                        cur.execute("INSERT OR IGNORE INTO vocab_active_session (user_id, word_id) VALUES (?, NULL)", (user_id,))
+                else:
+                    cur.execute(
+                        """
+                        INSERT INTO vocab_active_session (user_id, word_id)
+                        VALUES (?, ?)
+                        ON CONFLICT(user_id) DO UPDATE SET word_id = excluded.word_id, updated_at = datetime('now')
+                        """,
+                        (user_id, int(word_id)),
+                    )
+                return True
+            else:
+                with conn.cursor() as cur:
+                    if word_id is None:
+                        cur.execute("UPDATE vocab_active_session SET word_id = NULL WHERE user_id = %s", (user_id,))
+                        return True
+                    cur.execute(
+                        """
+                        INSERT INTO vocab_active_session (user_id, word_id)
+                        VALUES (%s, %s)
+                        ON CONFLICT(user_id) DO UPDATE SET
+                          word_id = EXCLUDED.word_id,
+                          updated_at = NOW()
+                        """,
+                        (user_id, int(word_id)),
+                    )
+                    return True
+    except Exception as e:
+        logger.exception("set_vocab_active_word failed: %s", e)
+        return False
+
+
+def get_vocab_active_word(user_id: int) -> int | None:
+    """Return active word_id for user or None."""
+    try:
+        with get_connection() as conn:
+            if conn is None:
+                return None
+            is_sqlite = conn.__class__.__module__.startswith("sqlite3")
+            if is_sqlite:
+                cur = conn.cursor()
+                cur.execute("SELECT word_id FROM vocab_active_session WHERE user_id = ?", (user_id,))
+                row = cur.fetchone()
+            else:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT word_id FROM vocab_active_session WHERE user_id = %s", (user_id,))
+                    row = cur.fetchone()
+            if not row:
+                return None
+            return int(row[0]) if row[0] is not None else None
+    except Exception as e:
+        logger.exception("get_vocab_active_word failed: %s", e)
+        return None
+
+
+def clear_vocab_active_word(user_id: int) -> bool:
+    """Clear active word for the user."""
+    return set_vocab_active_word(user_id, None)

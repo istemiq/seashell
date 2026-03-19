@@ -41,6 +41,7 @@ FAQ:
 import logging
 from telebot import types
 
+from i18n import t
 from db import (
     get_words,
     add_word,
@@ -52,6 +53,10 @@ from db import (
     add_examples_batch,
     get_native_language,
     update_word_meaning,
+    increment_usage,
+    set_vocab_active_word,
+    get_vocab_active_word,
+    clear_vocab_active_word,
 )
 
 logger = logging.getLogger(__name__)
@@ -66,6 +71,22 @@ _study_word_by_chat = {}
 
 WORDS_PER_PAGE = 10
 
+_COOLDOWN_SECONDS = 3
+_vocab_cooldowns = {}
+
+
+def _cooldown_ok(user_id: int, key: str) -> bool:
+    """Simple in-memory anti-spam cooldown for expensive actions."""
+    import time
+
+    now = time.time()
+    cooldown_key = (user_id, key)
+    until = _vocab_cooldowns.get(cooldown_key, 0)
+    if now < until:
+        return False
+    _vocab_cooldowns[cooldown_key] = now + _COOLDOWN_SECONDS
+    return True
+
 
 def _show_words_page(bot, chat_id: int, message_id: int, page: int):
     """
@@ -78,6 +99,8 @@ def _show_words_page(bot, chat_id: int, message_id: int, page: int):
     if page < 0:
         page = 0
 
+    lang = get_native_language(chat_id)
+
     offset = page * WORDS_PER_PAGE
     # db.py falls back to local SQLite when DATABASE_URL is missing
     words = get_words(chat_id, limit=WORDS_PER_PAGE + 1, offset=offset)
@@ -85,10 +108,10 @@ def _show_words_page(bot, chat_id: int, message_id: int, page: int):
     markup = types.InlineKeyboardMarkup()
     if not words:
         # Empty state: user has no words yet.
-        markup.add(types.InlineKeyboardButton("← Back", callback_data="vocab_menu"))
-        markup.add(types.InlineKeyboardButton("Main menu", callback_data="restart"))
+        markup.add(types.InlineKeyboardButton(f"← {t(lang, 'back')}", callback_data="vocab_menu"))
+        markup.add(types.InlineKeyboardButton(t(lang, "main_menu"), callback_data="restart"))
         bot.edit_message_text(
-            "No words yet. Tap «Add word» to add one.",
+            t(lang, "no_words_yet"),
             chat_id,
             message_id,
             reply_markup=markup,
@@ -107,16 +130,16 @@ def _show_words_page(bot, chat_id: int, message_id: int, page: int):
 
     nav = []
     if page > 0:
-        nav.append(types.InlineKeyboardButton("← Prev", callback_data=f"vocab_list_p{page-1}"))
+        nav.append(types.InlineKeyboardButton(t(lang, "prev_page"), callback_data=f"vocab_list_p{page-1}"))
     if has_next:
-        nav.append(types.InlineKeyboardButton("Next →", callback_data=f"vocab_list_p{page+1}"))
+        nav.append(types.InlineKeyboardButton(t(lang, "next_page"), callback_data=f"vocab_list_p{page+1}"))
     if nav:
         markup.row(*nav)
 
-    markup.add(types.InlineKeyboardButton("← Back", callback_data="vocab_menu"))
-    markup.add(types.InlineKeyboardButton("Main menu", callback_data="restart"))
+    markup.add(types.InlineKeyboardButton(f"← {t(lang, 'back')}", callback_data="vocab_menu"))
+    markup.add(types.InlineKeyboardButton(t(lang, "main_menu"), callback_data="restart"))
     bot.edit_message_text(
-        f"Your words (page {page+1}). Tap one to manage/study.",
+        t(lang, "your_words_page", p=page + 1),
         chat_id,
         message_id,
         reply_markup=markup,
@@ -129,15 +152,16 @@ def show_vocabulary_menu(bot, message):
     Called from `main.py` when user taps the main menu button "VOCABULARY".
     """
     chat_id = message.chat.id
+    lang = get_native_language(chat_id)
     logger.info("Showing vocabulary menu for chat_id=%s", chat_id)
 
     markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("My words", callback_data="vocab_list"))
-    markup.add(types.InlineKeyboardButton("Add word", callback_data="vocab_add"))
-    markup.add(types.InlineKeyboardButton("← Back", callback_data="vocab_back"))
-    markup.add(types.InlineKeyboardButton("← Main menu", callback_data="restart"))
+    markup.add(types.InlineKeyboardButton(t(lang, "vocab_my_words"), callback_data="vocab_list"))
+    markup.add(types.InlineKeyboardButton(t(lang, "vocab_add_word"), callback_data="vocab_add"))
+    markup.add(types.InlineKeyboardButton(f"← {t(lang, 'back')}", callback_data="vocab_back"))
+    markup.add(types.InlineKeyboardButton(f"← {t(lang, 'main_menu')}", callback_data="restart"))
 
-    text = "VOCABULARY\n\nYour saved words for practice. (Stub: full UI coming soon.)"
+    text = f"{t(lang, 'vocab_title')}\n\n{t(lang, 'vocab_title')} (Stub UI)."
     bot.reply_to(message, text, reply_markup=markup)
 
 
@@ -163,19 +187,22 @@ def handle_vocabulary_callback(bot, call):
     if data == "vocab_back":
         # Back from Vocabulary feature to global main menu.
         from main import get_main_menu_markup
-        bot.send_message(chat_id, "Choose an action:", reply_markup=get_main_menu_markup())
+        from db import get_native_language
+        lang = get_native_language(chat_id)
+        bot.send_message(chat_id, t(lang, "welcome_choose_action"), reply_markup=get_main_menu_markup(chat_id))
         return
 
     if data == "vocab_menu":
         # Vocabulary "home" screen; also cancels add-word mode.
         _vocab_add_state.discard(chat_id)
+        lang = get_native_language(chat_id)
         markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("My words", callback_data="vocab_list"))
-        markup.add(types.InlineKeyboardButton("Add word", callback_data="vocab_add"))
-        markup.add(types.InlineKeyboardButton("← Back", callback_data="vocab_back"))
-        markup.add(types.InlineKeyboardButton("← Main menu", callback_data="restart"))
+        markup.add(types.InlineKeyboardButton(t(lang, "vocab_my_words"), callback_data="vocab_list"))
+        markup.add(types.InlineKeyboardButton(t(lang, "vocab_add_word"), callback_data="vocab_add"))
+        markup.add(types.InlineKeyboardButton(f"← {t(lang, 'back')}", callback_data="vocab_back"))
+        markup.add(types.InlineKeyboardButton(f"← {t(lang, 'main_menu')}", callback_data="restart"))
         bot.edit_message_text(
-            "VOCABULARY\n\nYour saved words for practice. (Stub: full UI coming soon.)",
+            f"{t(lang, 'vocab_title')}\n\n{t(lang, 'vocab_title')} (Stub UI).",
             chat_id,
             call.message.message_id,
             reply_markup=markup,
@@ -205,29 +232,80 @@ def handle_vocabulary_callback(bot, call):
             return
         row = get_word(chat_id, word_id)
         if not row:
-            bot.send_message(chat_id, "Word not found (maybe deleted).")
+            lang = get_native_language(chat_id)
+            bot.send_message(chat_id, t(lang, "word_not_found"))
             return
         _, word, meaning, _ = row
         if not meaning:
             # If translation/meaning is missing, generate it automatically
             # using the user's native language from Settings.
             native_lang = get_native_language(chat_id)
-            translated = _translate_word_via_ai(word, native_lang)
+            translated = None
+            if _cooldown_ok(chat_id, f"translate_{word_id}"):
+                translated = _translate_word_via_ai(word, native_lang)
             if translated:
                 meaning = translated
                 # Persist translation so we don't spend tokens next time.
                 update_word_meaning(chat_id, word_id, translated)
 
+        lang = get_native_language(chat_id)
         markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("Study", callback_data=f"vocab_study_{word_id}"))
-        markup.add(types.InlineKeyboardButton("Delete", callback_data=f"vocab_delete_{word_id}"))
-        markup.add(types.InlineKeyboardButton("← Back", callback_data="vocab_list_p0"))
-        markup.add(types.InlineKeyboardButton("Main menu", callback_data="restart"))
+        markup.add(types.InlineKeyboardButton(t(lang, "study"), callback_data=f"vocab_study_{word_id}"))
+        markup.add(types.InlineKeyboardButton(t(lang, "delete"), callback_data=f"vocab_delete_{word_id}"))
+        if not meaning:
+            markup.add(
+                types.InlineKeyboardButton(
+                    t(lang, "update_translation"),
+                    callback_data=f"vocab_update_translation_{word_id}",
+                )
+            )
+        markup.add(types.InlineKeyboardButton(f"← {t(lang, 'back')}", callback_data="vocab_list_p0"))
+        markup.add(types.InlineKeyboardButton(t(lang, "main_menu"), callback_data="restart"))
 
-        text = f"WORD: {word}"
+        text = f"{t(lang, 'word')}: {word}"
         if meaning:
-            text += f"\nMEANING: {meaning}"
+            text += f"\n{t(lang, 'meaning')}: {meaning}"
+        else:
+            text += f"\n{t(lang, 'meaning')}: {t(lang, 'translation_missing')}"
         bot.edit_message_text(text, chat_id, call.message.message_id, reply_markup=markup)
+        return
+
+    if data.startswith("vocab_update_translation_"):
+        # User explicitly requested "regenerate translation" for this word.
+        try:
+            word_id = int(data.split("_")[3])
+        except Exception:
+            bot.send_message(chat_id, "Invalid word id.")
+            return
+        if not _cooldown_ok(chat_id, f"translate_{word_id}"):
+            bot.send_message(chat_id, t(get_native_language(chat_id), "waiting_retry"))
+            return
+
+        row = get_word(chat_id, word_id)
+        if not row:
+            bot.send_message(chat_id, t(get_native_language(chat_id), "word_not_found"))
+            return
+        _, word, _meaning, _ = row
+        native_lang = get_native_language(chat_id)
+        translated = _translate_word_via_ai(word, native_lang)
+        if translated:
+            update_word_meaning(chat_id, word_id, translated)
+            lang = native_lang
+            markup = types.InlineKeyboardMarkup()
+            markup.add(
+                types.InlineKeyboardButton(t(lang, "study"), callback_data=f"vocab_study_{word_id}")
+            )
+            markup.add(types.InlineKeyboardButton(t(lang, "delete"), callback_data=f"vocab_delete_{word_id}"))
+            markup.add(types.InlineKeyboardButton(f"← {t(lang, 'back')}", callback_data="vocab_list_p0"))
+            markup.add(types.InlineKeyboardButton(t(lang, "main_menu"), callback_data="restart"))
+            bot.edit_message_text(
+                f"{t(lang, 'word')}: {word}\n{t(lang, 'meaning')}: {translated}",
+                chat_id,
+                call.message.message_id,
+                reply_markup=markup,
+            )
+        else:
+            bot.send_message(chat_id, t(native_lang, "translation_not_ready"))
         return
 
     if data.startswith("vocab_delete_") and not data.startswith("vocab_delete_confirm_"):
@@ -239,13 +317,14 @@ def handle_vocabulary_callback(bot, call):
             return
         row = get_word(chat_id, word_id)
         word_label = row[1] if row else "this word"
+        lang = get_native_language(chat_id)
         markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("Yes, delete", callback_data=f"vocab_delete_confirm_{word_id}"))
-        markup.add(types.InlineKeyboardButton("No", callback_data=f"vocab_word_{word_id}"))
-        markup.add(types.InlineKeyboardButton("← Back", callback_data=f"vocab_word_{word_id}"))
-        markup.add(types.InlineKeyboardButton("Main menu", callback_data="restart"))
+        markup.add(types.InlineKeyboardButton(t(lang, "yes_delete"), callback_data=f"vocab_delete_confirm_{word_id}"))
+        markup.add(types.InlineKeyboardButton(t(lang, "cancel"), callback_data=f"vocab_word_{word_id}"))
+        markup.add(types.InlineKeyboardButton(f"← {t(lang, 'back')}", callback_data=f"vocab_word_{word_id}"))
+        markup.add(types.InlineKeyboardButton(t(lang, "main_menu"), callback_data="restart"))
         bot.edit_message_text(
-            f"Delete '{word_label}'?",
+            t(lang, "delete_confirm", w=word_label),
             chat_id,
             call.message.message_id,
             reply_markup=markup,
@@ -257,10 +336,11 @@ def handle_vocabulary_callback(bot, call):
         try:
             word_id = int(data.split("_")[3])
         except Exception:
-            bot.send_message(chat_id, "Invalid word id.")
+            bot.send_message(chat_id, t(get_native_language(chat_id), "invalid_word_id"))
             return
         ok = delete_word(chat_id, word_id)
-        bot.send_message(chat_id, "Deleted." if ok else "Could not delete (not found).")
+        lang = get_native_language(chat_id)
+        bot.send_message(chat_id, t(lang, "deleted") if ok else t(lang, "could_not_delete"))
         _show_words_page(bot, chat_id, call.message.message_id, page=0)
         return
 
@@ -272,6 +352,10 @@ def handle_vocabulary_callback(bot, call):
             bot.send_message(chat_id, "Invalid word id.")
             return
         _study_word_by_chat[chat_id] = word_id
+        try:
+            set_vocab_active_word(chat_id, word_id)
+        except Exception:
+            pass
         # Serve first example: uses cache if present, otherwise generates a new batch.
         _show_next_study_example(bot, chat_id, call.message, force_refresh=False)
         return
@@ -279,6 +363,11 @@ def handle_vocabulary_callback(bot, call):
     if data == "vocab_next_example":
         # Serve next cached example (generates new batch only if cache is empty).
         word_id = _study_word_by_chat.get(chat_id)
+        if not word_id:
+            # After bot restart we may have lost in-memory state, so restore from DB.
+            word_id = get_vocab_active_word(chat_id)
+            if word_id:
+                _study_word_by_chat[chat_id] = word_id
         if not word_id:
             bot.send_message(chat_id, "No active word. Pick a word first.")
             return
@@ -290,6 +379,10 @@ def handle_vocabulary_callback(bot, call):
         # - If cache is not empty -> just serve next cached example
         # - If cache is empty -> generate a new batch and serve from it
         word_id = _study_word_by_chat.get(chat_id)
+        if not word_id:
+            word_id = get_vocab_active_word(chat_id)
+            if word_id:
+                _study_word_by_chat[chat_id] = word_id
         if not word_id:
             bot.send_message(chat_id, "No active word. Pick a word first.")
             return
@@ -315,6 +408,12 @@ def handle_vocabulary_callback(bot, call):
 def cancel_add_word_mode(chat_id: int) -> None:
     """Leave 'add word' mode (e.g. when user goes to main menu)."""
     _vocab_add_state.discard(chat_id)
+    # Clear active study word to avoid stale Next/Refresh after navigation/restart.
+    try:
+        _study_word_by_chat.pop(chat_id, None)
+        clear_vocab_active_word(chat_id)
+    except Exception:
+        pass
 
 
 def is_adding_word(chat_id: int) -> bool:
@@ -350,6 +449,7 @@ def consume_add_word(bot, chat_id, text: str) -> bool:
     ok = add_word(chat_id, word, meaning)
     if ok:
         bot.send_message(chat_id, f"Added: {word}" + (f" — {meaning}" if meaning else ""))
+        increment_usage(chat_id, "words_added", 1)
     else:
         bot.send_message(chat_id, "Could not add word. Check database connection.")
     return True
@@ -369,9 +469,11 @@ def _show_next_study_example(
     word_id = _study_word_by_chat.get(chat_id)
     row = get_word(chat_id, word_id) if word_id else None
     if not row:
-        bot.send_message(chat_id, "Word not found. Go back to Vocabulary.")
+        lang = get_native_language(chat_id)
+        bot.send_message(chat_id, t(lang, "word_not_found"))
         return
     _, word, meaning, _ = row
+    lang = get_native_language(chat_id)
 
     # How many cached examples we have BEFORE consuming one.
     remaining_before = count_unserved_examples(chat_id, word_id)
@@ -384,34 +486,46 @@ def _show_next_study_example(
     if picked is None and generate_if_empty:
         # Cache is empty: ask the AI to generate a batch (up to 10),
         # store them in DB, then pop the first one.
+        if not _cooldown_ok(chat_id, f"examples_{word_id}"):
+            bot.send_message(chat_id, "Подождите пару секунд и попробуйте ещё раз.")
+            return
         examples = _generate_examples_via_ai(word, meaning, count=10)
         if examples:
-            add_examples_batch(chat_id, word_id, examples)
+            batch_id = add_examples_batch(chat_id, word_id, examples)
+            if batch_id:
+                increment_usage(chat_id, "examples_generated", len(examples))
         picked = pop_next_example(chat_id, word_id)
 
     remaining = count_unserved_examples(chat_id, word_id)
 
     if not picked:
-        bot.send_message(chat_id, "Could not get an example right now. Try again.")
+        bot.send_message(chat_id, t(lang, "could_not_get_example"))
         return
 
     _, example_text, _batch_id = picked
 
     markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("Next example", callback_data="vocab_next_example"))
-    markup.add(types.InlineKeyboardButton("Refresh example", callback_data="vocab_refresh_example"))
-    markup.add(types.InlineKeyboardButton("← Back", callback_data=f"vocab_word_{word_id}"))
-    markup.add(types.InlineKeyboardButton("Main menu", callback_data="restart"))
+    markup.add(types.InlineKeyboardButton(t(lang, "next_example"), callback_data="vocab_next_example"))
+    markup.add(types.InlineKeyboardButton(t(lang, "refresh_example"), callback_data="vocab_refresh_example"))
+    markup.add(types.InlineKeyboardButton(f"← {t(lang, 'back')}", callback_data=f"vocab_word_{word_id}"))
+    markup.add(types.InlineKeyboardButton(t(lang, "main_menu"), callback_data="restart"))
 
-    header = f"STUDY: {word}"
+    header = t(lang, "study_header", w=word)
     if meaning:
         header += f" — {meaning}"
     used_cache = remaining_before > 0
     source = "cache" if used_cache else "new batch"
-    text = f"{header}\n\nExample:\n{example_text}\n\nCached remaining: {remaining} (source: {source})"
+    text = (
+        f"{header}\n\n"
+        f"{t(lang, 'example')}\n"
+        f"{example_text}\n\n"
+        f"{t(lang, 'cached_remaining', n=remaining, src=source)}"
+    )
 
     # Send text
     bot.send_message(chat_id, text, reply_markup=markup)
+    # Example was successfully shown to the user.
+    increment_usage(chat_id, "examples_served", 1)
 
     # Send audio (gTTS+ffmpeg pipeline from speaking_practice)
     try:

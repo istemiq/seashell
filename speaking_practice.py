@@ -42,6 +42,16 @@ import requests
 import urllib3
 from telebot import types
 import uuid
+import time
+
+from db import (
+    get_speaking_session,
+    set_speaking_session,
+    clear_speaking_session,
+    increment_usage,
+)
+from db import get_native_language
+from i18n import t
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +71,21 @@ GIGACHAT_MODEL_NAME = os.getenv("GIGACHAT_MODEL_NAME")
 #   - conversation_history: list of messages (role/content)
 #   - chat_id: redundant but convenient
 user_speaking_state = {}
+
+# Anti-spam for expensive actions (AI + voice).
+_speaking_cooldowns: dict[tuple[int, str], float] = {}
+_SPEAKING_COOLDOWN_SECONDS = 3
+
+
+def _cooldown_ok(user_id: int, key: str) -> bool:
+    """In-memory cooldown to prevent repeated expensive requests."""
+    now = time.time()
+    cooldown_key = (user_id, key)
+    until = _speaking_cooldowns.get(cooldown_key, 0.0)
+    if now < until:
+        return False
+    _speaking_cooldowns[cooldown_key] = now + _SPEAKING_COOLDOWN_SECONDS
+    return True
 
 SPEECH_SPEEDS = {"slow": "Slow", "normal": "Normal", "fast": "Fast"}
 
@@ -328,19 +353,22 @@ def recognize_voice_message(bot, message):
 def show_speaking_menu(bot, message):
     """Show Start practice / Speech speed; we use chat_id as user id for state."""
     user_id = message.chat.id
+    lang = get_native_language(user_id)
     logger.info("Показ меню Speaking Practice для user_id/chat_id=%s", user_id)
 
     markup = types.InlineKeyboardMarkup()
-    btn_start = types.InlineKeyboardButton("Start practice", callback_data="speaking_start")
+    btn_start = types.InlineKeyboardButton(
+        t(lang, "speaking_start_practice"), callback_data="speaking_start"
+    )
     markup.add(btn_start)
     markup.add(
         types.InlineKeyboardButton(
-            "Speech speed settings", callback_data="speaking_speed_settings"
+            t(lang, "speaking_speed_settings"), callback_data="speaking_speed_settings"
         )
     )
     markup.add(
-        types.InlineKeyboardButton("← Back", callback_data="restart"),
-        types.InlineKeyboardButton("Main menu", callback_data="restart"),
+        types.InlineKeyboardButton(f"← {t(lang, 'back')}", callback_data="restart"),
+        types.InlineKeyboardButton(t(lang, "main_menu"), callback_data="restart"),
     )
 
     bot.reply_to(
@@ -371,19 +399,17 @@ def handle_speaking_callback(bot, call):
 
 def show_speed_settings(bot, message):
     """Show Slow / Normal / Fast and Back. Explains that speed affects voice (TTS) only."""
+    lang = get_native_language(message.chat.id)
     markup = types.InlineKeyboardMarkup()
     for speed, name in SPEECH_SPEEDS.items():
-        btn = types.InlineKeyboardButton(name, callback_data=f"speaking_speed_{speed}")
+        btn = types.InlineKeyboardButton(
+            t(lang, f"speaking_speed_{speed}"), callback_data=f"speaking_speed_{speed}"
+        )
         markup.add(btn)
-    markup.add(types.InlineKeyboardButton("← Back", callback_data="speaking"))
-    markup.add(types.InlineKeyboardButton("← Main menu", callback_data="restart"))
+    markup.add(types.InlineKeyboardButton(f"← {t(lang, 'back')}", callback_data="speaking"))
+    markup.add(types.InlineKeyboardButton(f"← {t(lang, 'main_menu')}", callback_data="restart"))
 
-    text = (
-        "Speech speed for voice messages:\n"
-        "• Slow = clearer, easier to follow\n"
-        "• Normal / Fast = quicker\n"
-        "Requires ffmpeg installed; otherwise you get text only."
-    )
+    text = t(lang, "speaking_voice_settings_tip")
     bot.reply_to(message, text, reply_markup=markup)
 
 
@@ -391,6 +417,7 @@ def start_speaking_practice(bot, message):
     """Create session in user_speaking_state, send welcome + buttons, first GigaChat reply if configured."""
     user_id = message.chat.id
     chat_id = message.chat.id
+    lang = get_native_language(user_id)
 
     user_speaking_state[user_id] = {
         "speed": "normal",
@@ -398,14 +425,16 @@ def start_speaking_practice(bot, message):
         "chat_id": chat_id,
     }
     logger.info("Сессия Speaking Practice начата: user_id/chat_id=%s", user_id)
+    # Persist initial session so it survives bot restarts.
+    try:
+        set_speaking_session(user_id, "normal", [])
+    except Exception:
+        pass
 
-    welcome_text = (
-        "Speaking practice started.\n"
-        "Send text or voice. I'll reply with text and voice (voice needs ffmpeg installed)."
-    )
+    welcome_text = t(lang, "speaking_welcome")
     markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("← Main menu", callback_data="speaking_end"))
-    markup.add(types.InlineKeyboardButton("Speed settings", callback_data="speaking_speed_settings"))
+    markup.add(types.InlineKeyboardButton(f"← {t(lang, 'main_menu')}", callback_data="speaking_end"))
+    markup.add(types.InlineKeyboardButton(t(lang, "speaking_speed_settings"), callback_data="speaking_speed_settings"))
 
     bot.send_message(chat_id, welcome_text, reply_markup=markup)
 
@@ -444,6 +473,12 @@ def end_speaking_practice(bot, message):
     user_id = message.chat.id
     chat_id = message.chat.id
 
+    # Clear persisted session too (survive bot restarts).
+    try:
+        clear_speaking_session(user_id)
+    except Exception:
+        pass
+
     if user_id in user_speaking_state:
         del user_speaking_state[user_id]
         logger.info("Сессия Speaking Practice завершена: user_id/chat_id=%s", user_id)
@@ -453,8 +488,8 @@ def end_speaking_practice(bot, message):
     from main import get_main_menu_markup
     bot.send_message(
         chat_id,
-        "Back to main menu.",
-        reply_markup=get_main_menu_markup(),
+        t(get_native_language(user_id), "back_to_main_menu"),
+        reply_markup=get_main_menu_markup(user_id),
     )
 
 
@@ -466,7 +501,16 @@ def change_speech_speed(bot, message, speed):
     if user_id in user_speaking_state:
         user_speaking_state[user_id]["speed"] = speed
         logger.info("Скорость речи изменена: user_id/chat_id=%s, speed=%s", user_id, speed)
-        bot.send_message(chat_id, f"Speech speed set to: {SPEECH_SPEEDS[speed]}")
+        lang = get_native_language(user_id)
+        bot.send_message(
+            chat_id,
+            t(lang, "speech_speed_set", s=t(lang, f"speaking_speed_{speed}")),
+        )
+        try:
+            history = user_speaking_state[user_id].get("conversation_history", [])
+            set_speaking_session(user_id, speed, history)
+        except Exception:
+            pass
     else:
         logger.debug("Попытка изменить скорость без активной сессии: user_id=%s", user_id)
         bot.send_message(chat_id, "Please start a Speaking Practice session first.")
@@ -485,13 +529,30 @@ def handle_speaking_input(bot, message):
         content_type,
     )
 
-    if user_id not in user_speaking_state:
-        # Auto-start session so user doesn't have to tap menu again
-        logger.info(
-            "Сообщение без активной сессии Speaking, авто-запуск. user_id=%s", user_id
-        )
-        start_speaking_practice(bot, message)
+    # Anti-spam: prevent repeated "expensive" requests from the same user.
+    if not _cooldown_ok(user_id, "speaking_input"):
+        bot.send_message(chat_id, "Подождите пару секунд, я отвечаю. ")
         return
+
+    if user_id not in user_speaking_state:
+        # Try to restore persisted session after bot restart.
+        try:
+            restored = get_speaking_session(user_id)
+        except Exception:
+            restored = None
+
+        if restored:
+            user_speaking_state[user_id] = {
+                "speed": restored.get("speed", "normal"),
+                "conversation_history": restored.get("conversation_history", []),
+                "chat_id": chat_id,
+            }
+            logger.info("Speaking session restored after restart for user_id=%s", user_id)
+        else:
+            # Auto-start session so user doesn't have to tap menu again
+            logger.info("Сообщение без активной сессии Speaking, авто-запуск. user_id=%s", user_id)
+            start_speaking_practice(bot, message)
+            return
 
     if content_type == "voice":
         recognized_text = recognize_voice_message(bot, message)
@@ -547,8 +608,19 @@ def send_gigachat_response(bot, user_id, system_prompt, user_message, access_tok
     chat_id = state.get("chat_id", user_id)
     history = state.get("conversation_history", [])
 
-    # Собираем messages: system (промпт из файла) + последние N сообщений истории + текущее user
-    messages = [{"role": "system", "content": system_prompt}]
+    # Coach formatting: we want answer + a short recap after it.
+    coach_format_instr = (
+        "Return your response in this exact format:\n"
+        "ANSWER:\n"
+        "<your main reply to the learner>\n"
+        "RECAP:\n"
+        "<1-2 short sentences: what the learner should improve next (simple, actionable)>\n"
+    )
+
+    # Собираем messages: system (промпт из файла) + last history + current user.
+    # We append our formatting instruction to avoid a second AI call (token saving).
+    system_prompt_full = system_prompt.rstrip() + "\n\n" + coach_format_instr
+    messages = [{"role": "system", "content": system_prompt_full}]
     messages.extend(history[-MAX_HISTORY_MESSAGES:])
     messages.append({"role": "user", "content": user_message})
 
@@ -582,12 +654,25 @@ def send_gigachat_response(bot, user_id, system_prompt, user_message, access_tok
 
         if response.status_code == 200:
             result = response.json()
-            ai_message = result["choices"][0]["message"]["content"]
-            logger.debug("Текст ответа GigaChat (начало): %s", ai_message[:100])
-            bot.send_message(chat_id, ai_message)
+            raw_content = result.get("choices", [{}])[0].get("message", {}).get("content", "") or ""
+            logger.debug("Текст ответа GigaChat (начало): %s", raw_content[:100])
+
+            # Parse ANSWER/RECAP.
+            answer_text = raw_content.strip()
+            recap_text = None
+            m_answer = re.search(r"ANSWER:\s*(.*?)(?:\n\s*RECAP:|\Z)", raw_content, flags=re.S | re.I)
+            if m_answer:
+                answer_text = (m_answer.group(1) or "").strip() or answer_text
+            m_recap = re.search(r"RECAP:\s*(.*)\Z", raw_content, flags=re.S | re.I)
+            if m_recap:
+                recap_text = (m_recap.group(1) or "").strip()
+
             speed = state.get("speed", "normal")
+
+            bot.send_message(chat_id, answer_text)
+            increment_usage(user_id, "speaking_turns", 1)
             try:
-                voice_ok = send_voice_reply(bot, chat_id, ai_message, speed)
+                voice_ok = send_voice_reply(bot, chat_id, answer_text, speed)
                 if not voice_ok and not user_speaking_state.get(user_id, {}).get("voice_hint_sent"):
                     bot.send_message(
                         chat_id,
@@ -599,19 +684,36 @@ def send_gigachat_response(bot, user_id, system_prompt, user_message, access_tok
                 logger.warning("Voice reply failed for chat_id=%s: %s", chat_id, voice_err)
                 bot.send_message(chat_id, "Voice not sent. Check server logs.")
 
+            if recap_text:
+                # Keep recap short and useful. This is the "quality" feature.
+                bot.send_message(chat_id, f"Recap: {recap_text}")
+                increment_usage(user_id, "speaking_recaps", 1)
+
             # Добавляем текущий обмен в историю, чтобы следующий запрос продолжал беседу
             if user_id in user_speaking_state:
                 user_speaking_state[user_id].setdefault("conversation_history", []).append(
                     {"role": "user", "content": user_message}
                 )
                 user_speaking_state[user_id]["conversation_history"].append(
-                    {"role": "assistant", "content": ai_message}
+                    {"role": "assistant", "content": answer_text}
                 )
                 # Оставляем только последние MAX_HISTORY_MESSAGES пар
                 h = user_speaking_state[user_id]["conversation_history"]
                 if len(h) > MAX_HISTORY_MESSAGES:
                     user_speaking_state[user_id]["conversation_history"] = h[-MAX_HISTORY_MESSAGES:]
-                logger.debug("История обновлена, сообщений в истории: %s", len(user_speaking_state[user_id]["conversation_history"]))
+                # Persist updated session for restart safety.
+                try:
+                    set_speaking_session(
+                        user_id,
+                        user_speaking_state[user_id].get("speed", speed),
+                        user_speaking_state[user_id]["conversation_history"],
+                    )
+                except Exception:
+                    pass
+                logger.debug(
+                    "История обновлена, сообщений в истории: %s",
+                    len(user_speaking_state[user_id]["conversation_history"]),
+                )
         else:
             logger.error(
                 "GigaChat вернул ошибку: status=%s, body=%s",

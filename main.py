@@ -40,23 +40,33 @@ import logging
 import telebot
 from telebot import types
 from dotenv import load_dotenv
+from i18n import t
 
 
-def get_main_menu_markup():
+def get_main_menu_markup(user_id: int | None = None):
     """
     Build the main menu keyboard.
 
     We keep this in one function so all modules can import and reuse it.
     That prevents "drifting" UIs where every module has a different main menu.
     """
+    native_lang = "ru"
+    if user_id is not None:
+        try:
+            from db import get_native_language
+
+            native_lang = get_native_language(user_id)
+        except Exception:
+            native_lang = "ru"
+
     markup = types.InlineKeyboardMarkup()
     markup.add(
-        types.InlineKeyboardButton("VOCABULARY", callback_data="vocabulary"),
-        types.InlineKeyboardButton("SPEAKING PRACTICE", callback_data="speaking"),
+        types.InlineKeyboardButton(t(native_lang, "main_menu_vocabulary"), callback_data="vocabulary"),
+        types.InlineKeyboardButton(t(native_lang, "main_menu_speaking"), callback_data="speaking"),
     )
     markup.add(
-        types.InlineKeyboardButton("RESTART", callback_data="restart"),
-        types.InlineKeyboardButton("SETTINGS", callback_data="settings"),
+        types.InlineKeyboardButton(t(native_lang, "main_menu_restart"), callback_data="restart"),
+        types.InlineKeyboardButton(t(native_lang, "main_menu_settings"), callback_data="settings"),
     )
     return markup
 
@@ -96,8 +106,8 @@ try:
     # Increase default request timeouts.
     # This helps when Telegram is slow, blocked, or network is unstable.
     import telebot.apihelper
-    telebot.apihelper.READ_TIMEOUT = 60
-    telebot.apihelper.CONNECT_TIMEOUT = 30
+    telebot.apihelper.READ_TIMEOUT = 120
+    telebot.apihelper.CONNECT_TIMEOUT = 60
     logger.info("Bot initialized.")
 except Exception as e:
     logger.exception("Failed to init bot: %s", e)
@@ -126,7 +136,48 @@ def handle_start(message):
     We answer by replying to that message with our main menu.
     """
     logger.info("%s from user_id=%s", message.text or "/start", message.from_user.id)
-    bot.reply_to(message, "Welcome. Choose an action:", reply_markup=get_main_menu_markup())
+    from_user_id = message.from_user.id
+
+    # /restart should always go directly to main menu (no onboarding gates).
+    if (message.text or "").strip().lower() == "/restart":
+        bot.reply_to(
+            message,
+            t("ru", "welcome_choose_action"),
+            reply_markup=get_main_menu_markup(from_user_id),
+        )
+        return
+
+    # /start: show onboarding if user never saw it.
+    try:
+        from db import is_onboarding_done, set_onboarding_done
+    except Exception:
+        is_onboarding_done = None
+
+    if is_onboarding_done and not is_onboarding_done(from_user_id):
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("1) Язык", callback_data="settings"))
+        markup.add(types.InlineKeyboardButton("2) Добавить слово", callback_data="vocab_add"))
+        markup.add(types.InlineKeyboardButton("3) Понял", callback_data="onboarding_done"))
+        markup.add(types.InlineKeyboardButton(t("ru", "main_menu"), callback_data="restart"))
+        bot.reply_to(
+            message,
+            "Welcome to Seashell.\n\nКоротко:\n1) Выберите родной язык в SETTINGS\n2) Add word — добавьте слово\n3) Study — бот выдаст пример + голос\n\nДавайте начнем?",
+            reply_markup=markup,
+        )
+        return
+
+    # /start main reply (translated).
+    try:
+        from db import get_native_language
+
+        lang = get_native_language(from_user_id)
+    except Exception:
+        lang = "ru"
+    bot.reply_to(
+        message,
+        t(lang, "welcome_choose_action"),
+        reply_markup=get_main_menu_markup(from_user_id),
+    )
 
 
 @bot.callback_query_handler(func=lambda call: True)
@@ -172,17 +223,62 @@ def handle_callback(call):
         except Exception:
             pass
         # Send a clean main menu message.
-        bot.send_message(
-            call.message.chat.id,
-            "Welcome. Choose an action:",
-            reply_markup=get_main_menu_markup(),
-        )
+        try:
+            from db import get_native_language
+
+            lang = get_native_language(call.message.chat.id)
+        except Exception:
+            lang = "ru"
+        # Try to update the same message containing the inline keyboard.
+        # This avoids confusion with "old" keyboards still visible behind.
+        try:
+            bot.edit_message_text(
+                t(lang, "welcome_choose_action"),
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=get_main_menu_markup(call.message.chat.id),
+            )
+        except Exception:
+            bot.send_message(
+                call.message.chat.id,
+                t(lang, "welcome_choose_action"),
+                reply_markup=get_main_menu_markup(call.message.chat.id),
+            )
         return
 
     if data == "settings":
         bot.answer_callback_query(call.id)
         from settings import show_settings_menu
         show_settings_menu(bot, call.message)
+        return
+
+    if data == "onboarding_done":
+        bot.answer_callback_query(call.id)
+        try:
+            from db import set_onboarding_done
+            set_onboarding_done(call.from_user.id, True)
+        except Exception:
+            pass
+        # Reuse same-place UI update.
+        try:
+            from db import get_native_language
+
+            lang = get_native_language(call.from_user.id)
+        except Exception:
+            lang = "ru"
+        try:
+            bot.edit_message_text(
+                t(lang, "welcome_choose_action"),
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=get_main_menu_markup(call.message.chat.id),
+            )
+        except Exception:
+            bot.send_message(
+                call.message.chat.id,
+                t(lang, "welcome_choose_action"),
+                reply_markup=get_main_menu_markup(call.message.chat.id),
+            )
         return
 
     if data.startswith("settings_"):
@@ -231,7 +327,7 @@ if __name__ == "__main__":
     try:
         # Long polling: Telegram holds the connection up to timeout seconds,
         # then we reconnect. `infinity_polling()` auto-restarts on recoverable errors.
-        bot.infinity_polling()
+        bot.infinity_polling(timeout=60, long_polling_timeout=60)
     except KeyboardInterrupt:
         logger.info("Stopped by user.")
     except Exception as e:
