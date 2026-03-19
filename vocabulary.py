@@ -187,7 +187,6 @@ def handle_vocabulary_callback(bot, call):
     if data == "vocab_back":
         # Back from Vocabulary feature to global main menu.
         from main import get_main_menu_markup
-        from db import get_native_language
         lang = get_native_language(chat_id)
         bot.send_message(chat_id, t(lang, "welcome_choose_action"), reply_markup=get_main_menu_markup(chat_id))
         return
@@ -357,7 +356,17 @@ def handle_vocabulary_callback(bot, call):
         except Exception:
             pass
         # Serve first example: uses cache if present, otherwise generates a new batch.
-        _show_next_study_example(bot, chat_id, call.message, force_refresh=False)
+        try:
+            _show_next_study_example(bot, chat_id, call.message, force_refresh=False)
+        except Exception as e:
+            logger.exception(
+                "Study screen failed chat_id=%s word_id=%s: %s",
+                chat_id,
+                word_id,
+                e,
+            )
+            lang = get_native_language(chat_id)
+            bot.send_message(chat_id, t(lang, "could_not_get_example"))
         return
 
     if data == "vocab_next_example":
@@ -371,7 +380,17 @@ def handle_vocabulary_callback(bot, call):
         if not word_id:
             bot.send_message(chat_id, "No active word. Pick a word first.")
             return
-        _show_next_study_example(bot, chat_id, call.message, force_refresh=False)
+        try:
+            _show_next_study_example(bot, chat_id, call.message, force_refresh=False)
+        except Exception as e:
+            logger.exception(
+                "Next example failed chat_id=%s word_id=%s: %s",
+                chat_id,
+                word_id,
+                e,
+            )
+            lang = get_native_language(chat_id)
+            bot.send_message(chat_id, t(lang, "could_not_get_example"))
         return
 
     if data == "vocab_refresh_example":
@@ -387,7 +406,23 @@ def handle_vocabulary_callback(bot, call):
             bot.send_message(chat_id, "No active word. Pick a word first.")
             return
         # Token-saving: use cache first; generate only when cache is empty
-        _show_next_study_example(bot, chat_id, call.message, force_refresh=False, generate_if_empty=True)
+        try:
+            _show_next_study_example(
+                bot,
+                chat_id,
+                call.message,
+                force_refresh=False,
+                generate_if_empty=True,
+            )
+        except Exception as e:
+            logger.exception(
+                "Refresh example failed chat_id=%s word_id=%s: %s",
+                chat_id,
+                word_id,
+                e,
+            )
+            lang = get_native_language(chat_id)
+            bot.send_message(chat_id, t(lang, "could_not_get_example"))
         return
 
     if data == "vocab_add":
